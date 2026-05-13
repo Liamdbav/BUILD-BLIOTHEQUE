@@ -51,10 +51,12 @@ Session Claude Code (projet quelconque)
 ```bash
 # Option 1 — VAULT déjà défini dans l'environnement
 export VAULT="/chemin/absolu/vers/ton/vault"
-bash setup.sh
+chmod +x setup.sh
+./setup.sh
 
 # Option 2 — interactif (le script demande le chemin)
-bash setup.sh
+chmod +x setup.sh
+./setup.sh
 ```
 
 Le script est **idempotent** : peut être relancé sans danger. Il demande confirmation avant d'écraser un fichier existant.
