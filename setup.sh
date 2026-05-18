@@ -70,7 +70,7 @@ if [[ -z "${VAULT:-}" ]]; then
   echo ""
   echo -e "${C3}  ▷${NC} Ecrire automatiquement dans ~/.zshrc ? ${DIM}[o/N]${NC}"
   read -r -p "    > " ADD_TO_RC
-  if [[ "${ADD_TO_RC,,}" == "o" ]]; then
+  if [[ "$(echo "$ADD_TO_RC" | tr '[:upper:]' '[:lower:]')" == "o" ]]; then
     echo "" >> ~/.zshrc
     echo "# Vault Obsidian - injecte par BUILD-BLIOTHEQUE-install.sh" >> ~/.zshrc
     echo "export VAULT=\"${VAULT}\"" >> ~/.zshrc
@@ -84,7 +84,7 @@ if [[ ! -d "$VAULT" ]]; then
   warn "Repertoire introuvable : $VAULT"
   echo -e "${C3}  ▷${NC} Creer le Vault ? ${DIM}[o/N]${NC}"
   read -r -p "    > " CREATE_VAULT
-  if [[ "${CREATE_VAULT,,}" == "o" ]]; then
+  if [[ "$(echo "$CREATE_VAULT" | tr '[:upper:]' '[:lower:]')" == "o" ]]; then
     mkdir -p "$VAULT"
     ok "Vault initialise : $VAULT"
   else
@@ -166,7 +166,7 @@ if [[ -f "$HOOK_FILE" ]]; then
   info "$HOOK_FILE"
   echo -e "${C3}  ▷${NC} Ecraser avec la version courante ? ${DIM}[o/N]${NC}"
   read -r -p "    > " OVERWRITE_HOOK
-  [[ "${OVERWRITE_HOOK,,}" != "o" ]] && { ok "Hook conserve."; SKIP_HOOK=1; }
+  [[ "$(echo "$OVERWRITE_HOOK" | tr '[:upper:]' '[:lower:]')" != "o" ]] && { ok "Hook conserve."; SKIP_HOOK=1; }
 fi
 
 if [[ -z "$SKIP_HOOK" ]]; then
@@ -274,7 +274,7 @@ if [[ -f "$SETTINGS_PATH" ]]; then
   echo ""
   echo -e "${C3}  ▷${NC} Fusionner le hook Stop dans settings.json ? ${DIM}[o/N]${NC}"
   read -r -p "    > " CONFIRM_SETTINGS
-  [[ "${CONFIRM_SETTINGS,,}" != "o" ]] && { warn "settings.json non modifie."; SKIP_SETTINGS=1; }
+  [[ "$(echo "$CONFIRM_SETTINGS" | tr '[:upper:]' '[:lower:]')" != "o" ]] && { warn "settings.json non modifie."; SKIP_SETTINGS=1; }
 fi
 
 if [[ -z "$SKIP_SETTINGS" ]]; then
@@ -323,7 +323,7 @@ if [[ -f "$COMMAND_FILE" ]]; then
   info "$COMMAND_FILE"
   echo -e "${C3}  ▷${NC} Ecraser ? ${DIM}[o/N]${NC}"
   read -r -p "    > " OVERWRITE_CMD
-  [[ "${OVERWRITE_CMD,,}" != "o" ]] && { ok "Commande conservee."; SKIP_CMD=1; }
+  [[ "$(echo "$OVERWRITE_CMD" | tr '[:upper:]' '[:lower:]')" != "o" ]] && { ok "Commande conservee."; SKIP_CMD=1; }
 fi
 
 if [[ -z "$SKIP_CMD" ]]; then
@@ -409,7 +409,7 @@ h1 "P5 // DIAGNOSTIC  *  END-TO-END TEST"
 echo -e "${C3}  ▷${NC} Lancer le test de bout en bout ? ${DIM}[o/N]${NC}"
 read -r -p "    > " RUN_TEST
 
-if [[ "${RUN_TEST,,}" == "o" ]]; then
+if [[ "$(echo "$RUN_TEST" | tr '[:upper:]' '[:lower:]')" == "o" ]]; then
 
   TEST_DIR=/tmp/TEST-RECETTE-INSTALL
   mkdir -p "$TEST_DIR"
