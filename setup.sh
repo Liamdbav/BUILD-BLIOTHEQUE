@@ -172,8 +172,9 @@ fi
 if [[ -z "$SKIP_HOOK" ]]; then
   cat > "$HOOK_FILE" << HOOK
 #!/usr/bin/env bash
-# Hook Stop Claude Code -- genere un brouillon de recette a chaque fin de session hors-Vault.
-# Claude Code envoie un payload JSON sur stdin : cwd, session_id, transcript_path.
+# Hook Stop Claude Code -- maintient un brouillon de recette par session, hors-Vault.
+# Payload JSON sur stdin : cwd, session_id, transcript_path.
+# Idempotent : a chaque Stop d'une meme session, le draft est reecrit avec le transcript a jour.
 # VAULT hardcode a l'install : ${VAULT}
 
 set -euo pipefail
@@ -185,25 +186,34 @@ if [[ ! -t 0 ]]; then
   PAYLOAD=\$(cat 2>/dev/null || true)
 fi
 
-SESSION_CWD=""
-if [[ -n "\$PAYLOAD" ]]; then
-  SESSION_CWD=\$(printf '%s' "\$PAYLOAD" | python3 -c "
+# Parse payload (cwd, session_id, transcript_path) en un seul appel Python
+PARSED=\$(printf '%s' "\$PAYLOAD" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d.get('cwd') or d.get('workspace', {}).get('project_dir', ''))
+    cwd = d.get('cwd') or d.get('workspace', {}).get('project_dir', '') or ''
+    sid = d.get('session_id', '') or ''
+    tpath = d.get('transcript_path', '') or ''
+    print(cwd)
+    print(sid)
+    print(tpath)
 except Exception:
-    pass
-" 2>/dev/null || true)
-fi
+    print(''); print(''); print('')
+" 2>/dev/null || printf '\n\n\n')
+
+SESSION_CWD=\$(printf '%s\n' "\$PARSED" | sed -n '1p')
+SESSION_ID=\$(printf '%s\n' "\$PARSED" | sed -n '2p')
+TRANSCRIPT_PATH=\$(printf '%s\n' "\$PARSED" | sed -n '3p')
+
 SESSION_CWD="\${SESSION_CWD:-\${CLAUDE_CWD:-\$(pwd)}}"
 SESSION_CWD=\$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "\$SESSION_CWD" 2>/dev/null || echo "\$SESSION_CWD")
 
 VAULT_REAL=\$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "\$VAULT" 2>/dev/null || echo "\$VAULT")
 [[ "\$SESSION_CWD" == "\$VAULT_REAL"* ]] && exit 0
 
-PROJECT_NAME=\$(basename "\$SESSION_CWD")
-[[ -z "\$PROJECT_NAME" ]] && exit 0
+PROJECT_RAW=\$(basename "\$SESSION_CWD")
+[[ -z "\$PROJECT_RAW" ]] && exit 0
+PROJECT_NAME=\$(printf '%s' "\$PROJECT_RAW" | tr '[:upper:]' '[:lower:]')
 
 TEMPLATE="\$VAULT/_templates/recette-projet.md"
 [[ ! -f "\$TEMPLATE" ]] && { echo "[hook] Template introuvable : \$TEMPLATE" >&2; exit 0; }
@@ -211,49 +221,175 @@ TEMPLATE="\$VAULT/_templates/recette-projet.md"
 DRAFT_DIR="\$VAULT/Projets"
 mkdir -p "\$DRAFT_DIR"
 
-SESSION_ID=""
-TRANSCRIPT_PATH=""
-if [[ -n "\$PAYLOAD" ]]; then
-  SESSION_ID=\$(printf '%s' "\$PAYLOAD" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(d.get('session_id', ''))
-except Exception:
-    pass
-" 2>/dev/null || true)
-  TRANSCRIPT_PATH=\$(printf '%s' "\$PAYLOAD" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(d.get('transcript_path', ''))
-except Exception:
-    pass
-" 2>/dev/null || true)
+# Identifiant court de session pour deduplication
+SESSION_ID_SHORT="\${SESSION_ID:0:8}"
+[[ -z "\$SESSION_ID_SHORT" ]] && SESSION_ID_SHORT="nosess\$\$"
+
+# Si un draft de cette session existe deja, on reutilise son nom (preserve la date de creation)
+EXISTING=\$(ls -1 "\$DRAFT_DIR"/.draft-"\${PROJECT_NAME}"-*-"\${SESSION_ID_SHORT}".md 2>/dev/null | head -1 || true)
+
+if [[ -n "\$EXISTING" ]]; then
+  DRAFT_FILE="\$EXISTING"
+  # Recupere la date d'origine encodee dans le nom (format YYYYMMDD-HHMMSS)
+  CREATED_DATE=\$(basename "\$EXISTING" | sed -n "s|^\.draft-\${PROJECT_NAME}-\\([0-9]\\{8\\}-[0-9]\\{6\\}\\)-.*|\\1|p")
+else
+  CREATED_DATE=\$(date +%Y%m%d-%H%M%S)
+  DRAFT_FILE="\$DRAFT_DIR/.draft-\${PROJECT_NAME}-\${CREATED_DATE}-\${SESSION_ID_SHORT}.md"
 fi
 
-TIMESTAMP=\$(date +%Y%m%d-%H%M%S)
 TODAY=\$(date +%Y-%m-%d)
-DRAFT_FILE="\$DRAFT_DIR/.draft-\${PROJECT_NAME}-\${TIMESTAMP}.md"
+NOW_HUMAN=\$(date '+%Y-%m-%d %H:%M:%S')
+CREATED_HUMAN=\$(printf '%s' "\$CREATED_DATE" | python3 -c "
+import sys
+s = sys.stdin.read().strip()
+if len(s) >= 15:
+    print(f'{s[0:4]}-{s[4:6]}-{s[6:8]} {s[9:11]}:{s[11:13]}:{s[13:15]}')
+else:
+    print(s)
+")
+CREATED_YMD=\$(printf '%s' "\$CREATED_DATE" | cut -c1-8 | python3 -c "
+import sys
+s = sys.stdin.read().strip()
+print(f'{s[0:4]}-{s[4:6]}-{s[6:8]}' if len(s) >= 8 else s)
+")
 
-CONTEXTE="Session du \$TODAY"
-[[ -n "\$SESSION_ID" ]] && CONTEXTE="\$CONTEXTE (session: \$SESSION_ID)"
+# ── Extraction du transcript ──────────────────────────────────────────────────
+TRANSCRIPT_BLOCK=""
+if [[ -n "\$TRANSCRIPT_PATH" && -f "\$TRANSCRIPT_PATH" ]]; then
+  TRANSCRIPT_BLOCK=\$(python3 - "\$TRANSCRIPT_PATH" << 'PYTRANS'
+import sys, json, datetime
 
-sed \\
-  -e "s|{{projet}}|\${PROJECT_NAME}|g" \\
-  -e "s|{{date}}|\${TODAY}|g" \\
-  -e "s|{{stack}}|a completer|g" \\
-  -e "s|{{techno-principale}}|a completer|g" \\
-  -e "s|{{intention}}|a completer|g" \\
-  -e "s|{{stack-effective}}|a completer|g" \\
-  -e "s|{{contexte}}|\${CONTEXTE}|g" \\
-  -e "s|{{intitule}}|premiere iteration|g" \\
-  -e "s|{{prompt}}|a extraire du transcript|g" \\
-  "\$TEMPLATE" > "\$DRAFT_FILE"
+path = sys.argv[1]
+prompts = []        # liste de (timestamp, text)
+tools = {}          # nom outil -> count
+n_user = 0
+n_assistant = 0
+first_ts = None
+last_ts = None
 
-[[ -n "\$TRANSCRIPT_PATH" ]] && printf '\n<!-- transcript: %s -->\n' "\$TRANSCRIPT_PATH" >> "\$DRAFT_FILE"
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
 
-echo "[hook] Brouillon depose : \$DRAFT_FILE"
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                if blk.get('type') == 'text' and blk.get('text'):
+                    parts.append(blk['text'])
+                elif blk.get('type') == 'tool_use':
+                    tools[blk.get('name', 'unknown')] = tools.get(blk.get('name', 'unknown'), 0) + 1
+        return '\n'.join(parts).strip()
+    return ''
+
+try:
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            ts = parse_ts(ev.get('timestamp'))
+            if ts:
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+            etype = ev.get('type')
+            msg = ev.get('message') or {}
+            role = msg.get('role') or etype
+            if role == 'user' and etype == 'user':
+                txt = extract_text(msg.get('content', ev.get('content', '')))
+                # Filtre les tool_result et messages systeme injectes
+                if txt and not txt.startswith('<') and 'tool_use_id' not in str(msg.get('content', '')):
+                    n_user += 1
+                    ts_str = ts.strftime('%H:%M:%S') if ts else '--:--:--'
+                    if len(txt) > 2000:
+                        txt = txt[:2000] + '… [tronque]'
+                    prompts.append((ts_str, txt))
+            elif role == 'assistant' and etype == 'assistant':
+                n_assistant += 1
+                extract_text(msg.get('content', []))  # collecte les outils
+except FileNotFoundError:
+    print('TRANSCRIPT_INTROUVABLE')
+    sys.exit(0)
+
+duration = ''
+if first_ts and last_ts:
+    delta = last_ts - first_ts
+    total = int(delta.total_seconds())
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    duration = f'{h}h{m:02d}m' if h else f'{m}m{s:02d}s'
+
+print('## Metadonnees session')
+print('')
+print(f'- Tours utilisateur : {n_user}')
+print(f'- Tours assistant : {n_assistant}')
+print('- Duree : ' + (duration or 'inconnue'))
+if tools:
+    tl = ', '.join(f'{k} ({v})' for k, v in sorted(tools.items(), key=lambda x: -x[1]))
+    print(f'- Outils invoques : {tl}')
+print('')
+print('## Prompts utilisateur (brut)')
+print('')
+if not prompts:
+    print('_aucun prompt utilisateur extrait_')
+else:
+    for i, (ts, txt) in enumerate(prompts, 1):
+        print(f'### Prompt {i} — {ts}')
+        print('')
+        print(txt)
+        print('')
+PYTRANS
+)
+fi
+
+# ── Generation du draft ───────────────────────────────────────────────────────
+{
+  echo '---'
+  echo "projet: \${PROJECT_NAME}"
+  echo "créé: \${CREATED_YMD}"
+  echo "dernière_maj: \${TODAY}"
+  echo "session_id: \${SESSION_ID}"
+  echo "stack: a completer"
+  echo "statut: draft"
+  echo "tags:"
+  echo "  - projet"
+  echo "  - brouillon"
+  echo '---'
+  echo ''
+  echo "# \${PROJECT_NAME} — brouillon de session"
+  echo ''
+  echo "Session initiee le \${CREATED_HUMAN}, derniere mise a jour \${NOW_HUMAN}."
+  echo ''
+  if [[ -n "\$TRANSCRIPT_BLOCK" ]]; then
+    printf '%s\n' "\$TRANSCRIPT_BLOCK"
+  else
+    echo '## Metadonnees session'
+    echo ''
+    echo '_transcript_path absent ou illisible_'
+    echo ''
+    echo '## Prompts utilisateur (brut)'
+    echo ''
+    echo '_indisponible_'
+    echo ''
+  fi
+  [[ -n "\$TRANSCRIPT_PATH" ]] && printf '<!-- transcript: %s -->\n' "\$TRANSCRIPT_PATH"
+} > "\$DRAFT_FILE.tmp"
+mv "\$DRAFT_FILE.tmp" "\$DRAFT_FILE"
+
+echo "[hook] Brouillon a jour : \$DRAFT_FILE"
 HOOK
 
   chmod 755 "$HOOK_FILE"
@@ -329,75 +465,86 @@ fi
 if [[ -z "$SKIP_CMD" ]]; then
   cat > "$COMMAND_FILE" << SLASHCMD
 ---
-description: Distille le transcript de session en recette one-shot rejouable dans le Vault
+description: Distille tous les brouillons de session du projet courant en une recette one-shot rejouable
 argument-hint: "[nom-du-projet]"
 allowed-tools: Read, Write, Edit, Bash
 ---
 
-Ton role : produire une recette rejouable sans erreur pour le projet \$ARGUMENTS.
+Ton role : produire UNE recette ultime, rejouable from scratch sans aucune erreur, pour le projet \$ARGUMENTS, en agregeant TOUS les brouillons de session disponibles.
 
-Le transcript de session contient le build reel -- avec l'exploration, les erreurs et les
-corrections. Ton travail est de distiller ce bruit en une sequence minimale de prompts
-parfaits, chacun one-shot, comme si le build avait ete parfait du premier coup.
+Chaque brouillon est un resume brut d'une session : prompts utilisateur horodate + metadonnees. La recette distillee doit reproduire le projet final tel qu'il existe aujourd'hui, en evitant TOUTES les erreurs rencontrees dans l'historique des sessions.
 
-ETAPE 1 -- Localise les sources
+ETAPE 0 -- Determine le nom du projet
 
-Brouillon : ${VAULT}/Projets/.draft-\$ARGUMENTS-*.md
-Si plusieurs, prends le plus recent. Si aucun, arrete et dis-le.
+Si \$ARGUMENTS est fourni et non vide :
+  NOM_AFFICHE = \$ARGUMENTS (casse preservee pour le nom du fichier final)
+  NOM_GLOB = \$ARGUMENTS en minuscules
+Sinon :
+  NOM_AFFICHE = basename de \$(pwd)
+  NOM_GLOB = NOM_AFFICHE en minuscules
 
-Le brouillon peut contenir un commentaire HTML <!-- transcript: /chemin --> -- extrais ce
-chemin en priorite. Sinon, cherche dans ~/.claude/transcripts/ le fichier le plus recent
-correspondant a \$ARGUMENTS. Si aucun transcript disponible, travaille depuis le brouillon
-en le signalant.
+ETAPE 1 -- Collecte TOUS les brouillons du projet
 
-ETAPE 2 -- Analyse le transcript
+Utilise un Bash unique :
 
-Lis l'integralite du transcript. Classifie chaque message utilisateur :
+  find ${VAULT}/Projets -maxdepth 1 -iname ".draft-\${NOM_GLOB}-*.md" -type f | sort
 
-STRUCTURANT : le prompt a produit un livrable persistant (fichier cree, config posee,
-fonctionnalite implementee). C'est le materiau de la recette.
+Lis CHAQUE fichier trouve avec l'outil Read. Si la liste est vide, arrete et affiche : "Aucun brouillon trouve pour \${NOM_AFFICHE} dans ${VAULT}/Projets/. Verifie que le hook Stop a bien depose des drafts."
 
-CORRECTIF : le prompt repond a une erreur du prompt precedent. Ne pas inclure tel quel --
-fusionner avec le prompt structurant parent pour produire un prompt consolide qui integre
-la contrainte des le depart.
+ETAPE 2 -- Analyse multi-sessions
+
+Pour chaque brouillon, parcours la section "## Prompts utilisateur (brut)". Classifie chaque prompt :
+
+STRUCTURANT : le prompt a produit un livrable persistant (fichier cree, config posee, fonctionnalite implementee). C'est le materiau de la recette.
+
+CORRECTIF : le prompt repond a une erreur d'un prompt precedent (meme ou autre session). Ne pas inclure tel quel -- fusionner avec le prompt structurant parent en integrant la contrainte des le depart.
 
 EXPLORATOIRE : le prompt n'a rien produit de persistant. Eliminer.
 
-ETAPE 3 -- Construis la sequence distillee
+Tiens compte des metadonnees (outils invoques, duree) pour identifier les sessions structurantes vs exploratoires.
 
-Pour chaque prompt structurant (apres fusion des correctifs) :
-- Reecris le prompt en integrant toutes les contraintes apprises pendant le build
-- Formule-le comme s'il etait passe en premier, sans contexte d'erreur
-- Verifie qu'il est autonome et rejouable isolement
-- Assigne-lui un resultat observable concret
+ETAPE 3 -- Distillation cross-sessions
 
-La sequence finale doit produire le meme livrable que le build reel, sans reproduire
-aucune des erreurs rencontrees.
+Construis UNE sequence unique de prompts parfaits, qui :
+- Reproduit l'etat final du projet
+- Integre toutes les contraintes apprises a travers les sessions
+- Formule chaque prompt comme s'il etait passe en premier, sans contexte d'erreur
+- Est autonome et rejouable isolement
+- A un resultat observable concret
+
+L'ordre suit la dependance logique du build, pas l'ordre chronologique des sessions.
 
 ETAPE 4 -- Ecris la note finale
 
-Ecris dans ${VAULT}/Projets/\$ARGUMENTS.md en suivant le format de ${VAULT}/_templates/recette-projet.md.
+Cible : ${VAULT}/Projets/\${NOM_AFFICHE}.md
+
+Suis le format de ${VAULT}/_templates/recette-projet.md.
 
 Contraintes frontmatter YAML (Obsidian) :
 - tags : liste a tirets, pas inline []
 - dates : format YYYY-MM-DD
 - statut -> stable
-- stack et tags deduits du transcript
-- cree = date du brouillon, derniere_maj = date du jour
+- stack et tags deduits du contenu des brouillons
+- cree = date du brouillon le plus ancien, derniere_maj = aujourd'hui
 
-Si le fichier existe deja : ajoute une nouvelle iteration en bas precedee d'un separateur ---.
-Ne remplace jamais le contenu existant.
-Dans le champ "Contexte" de chaque prompt : note quelle erreur reelle ce prompt consolide evite.
+Si le fichier existe deja : ajoute une nouvelle iteration en bas precedee d'un separateur ---. Ne remplace JAMAIS le contenu existant.
 
-ETAPE 5 -- Finalise
+Dans le champ "Contexte" de chaque prompt distille : note quelle erreur reelle (rencontree dans une des sessions) ce prompt consolide evite.
 
-Supprime ${VAULT}/Projets/.draft-\$ARGUMENTS-*.md.
+ETAPE 5 -- Nettoyage
+
+Une fois la note ecrite et verifiee, supprime TOUS les brouillons du projet :
+
+  find ${VAULT}/Projets -maxdepth 1 -iname ".draft-\${NOM_GLOB}-*.md" -type f -delete
+
+ETAPE 6 -- Recap
 
 Affiche :
 - Chemin de la note finale
-- Nombre de prompts dans la session originale
+- Nombre de sessions analysees
+- Nombre total de prompts utilisateur (tous brouillons confondus)
 - Nombre de prompts dans la recette distillee
-- Ratio de compression (ex : "18 -> 6 prompts distilles (67 %)")
+- Ratio de compression (ex : "47 -> 8 prompts distilles, 83 % de compression")
 SLASHCMD
 
   ok "Slash command deposee ${DIM}-> $COMMAND_FILE${NC}"
@@ -413,28 +560,55 @@ if [[ "$(echo "$RUN_TEST" | tr '[:upper:]' '[:lower:]')" == "o" ]]; then
 
   TEST_DIR=/tmp/TEST-RECETTE-INSTALL
   mkdir -p "$TEST_DIR"
+  TEST_TRANSCRIPT=/tmp/test-recette-transcript.jsonl
+  TEST_SESSION_ID="abc12345-test-fake-session-id-0000000000"
+  TEST_SESSION_SHORT="abc12345"
+
+  # Faux transcript .jsonl avec 2 prompts user + 1 tour assistant + 1 outil
+  cat > "$TEST_TRANSCRIPT" << 'JSONL'
+{"type":"user","timestamp":"2026-05-19T10:00:00Z","message":{"role":"user","content":"premier prompt de test"}}
+{"type":"assistant","timestamp":"2026-05-19T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","name":"Bash","input":{}}]}}
+{"type":"user","timestamp":"2026-05-19T10:01:00Z","message":{"role":"user","content":"second prompt apres correction"}}
+{"type":"assistant","timestamp":"2026-05-19T10:01:10Z","message":{"role":"assistant","content":[{"type":"text","text":"fait"}]}}
+JSONL
 
   echo ""
-  info "Injection payload JSON -- simulation Claude Code Stop event..."
-  HOOK_OUTPUT=$(printf '{"cwd":"%s","session_id":"test-install-001","transcript_path":""}' "$TEST_DIR" \
-    | VAULT="$VAULT" "$HOOK_FILE" 2>&1 || true)
-  echo -e "${C3}  ◎${NC} ${DIM}$HOOK_OUTPUT${NC}"
+  info "Injection #1 -- premier Stop event de la session $TEST_SESSION_SHORT..."
+  HOOK_OUT1=$(printf '{"cwd":"%s","session_id":"%s","transcript_path":"%s"}' "$TEST_DIR" "$TEST_SESSION_ID" "$TEST_TRANSCRIPT" \
+    | "$HOOK_FILE" 2>&1 || true)
+  echo -e "${C3}  ◎${NC} ${DIM}$HOOK_OUT1${NC}"
 
-  DRAFT=$(ls "$VAULT/Projets/.draft-TEST-RECETTE-INSTALL-"*.md 2>/dev/null | sort | tail -1 || true)
+  info "Injection #2 -- second Stop event de la MEME session (test idempotence)..."
+  HOOK_OUT2=$(printf '{"cwd":"%s","session_id":"%s","transcript_path":"%s"}' "$TEST_DIR" "$TEST_SESSION_ID" "$TEST_TRANSCRIPT" \
+    | "$HOOK_FILE" 2>&1 || true)
+  echo -e "${C3}  ◎${NC} ${DIM}$HOOK_OUT2${NC}"
 
-  if [[ -z "$DRAFT" ]]; then
-    err "Brouillon non trouve -- hook defaillant."
+  # Le projet est "test-recette-install" (basename minuscule)
+  DRAFTS=( $(ls "$VAULT/Projets/.draft-test-recette-install-"*-"${TEST_SESSION_SHORT}".md 2>/dev/null) )
+  N_DRAFTS=${#DRAFTS[@]}
+
+  if [[ "$N_DRAFTS" -eq 0 ]]; then
+    err "Aucun brouillon trouve -- hook defaillant."
+  elif [[ "$N_DRAFTS" -gt 1 ]]; then
+    err "Idempotence cassee : $N_DRAFTS brouillons pour une seule session."
+    printf '    %s\n' "${DRAFTS[@]}"
   else
-    ok "Brouillon genere ${DIM}-> $DRAFT${NC}"
+    DRAFT="${DRAFTS[0]}"
+    ok "Brouillon unique ${DIM}-> $DRAFT${NC}"
+    ok "Idempotence par session_id ${DIM}-> OK (2 Stop -> 1 fichier)${NC}"
 
-    COUNT=$(python3 -c "
-import re, sys
-content = open(sys.argv[1]).read()
-print(len(re.findall(r'\{\{[a-z-]+\}\}', content)))
-" "$DRAFT")
-    [[ "$COUNT" == "0" ]] \
-      && ok "Placeholders residuels ${DIM}-> 0${NC}" \
-      || warn "$COUNT placeholder(s) residuel(s)"
+    # Verifie la presence des sections cles
+    if grep -q '^## Metadonnees session' "$DRAFT" && grep -q '^## Prompts utilisateur' "$DRAFT"; then
+      ok "Sections resume + metadonnees ${DIM}-> presentes${NC}"
+    else
+      warn "Sections attendues manquantes dans le draft"
+    fi
+
+    if grep -q 'premier prompt de test' "$DRAFT" && grep -q 'second prompt apres correction' "$DRAFT"; then
+      ok "Prompts utilisateur extraits ${DIM}-> 2/2${NC}"
+    else
+      warn "Extraction des prompts utilisateur incomplete"
+    fi
 
     OBSIDIAN_CHECK=$(python3 -c "
 import sys
@@ -452,13 +626,15 @@ else:
 
     echo ""
     echo -e "${DIM}  ┌─ contenu brouillon ─────────────────────────────────────────${NC}"
-    cat "$DRAFT" | sed 's/^/    /'
+    sed 's/^/    /' "$DRAFT"
     echo -e "${DIM}  └─────────────────────────────────────────────────────────────${NC}"
 
     rm -f "$DRAFT"
-    rmdir "$TEST_DIR" 2>/dev/null || true
     ok "Nettoyage effectue"
   fi
+
+  rm -f "$TEST_TRANSCRIPT"
+  rmdir "$TEST_DIR" 2>/dev/null || true
 else
   warn "Test ignore."
 fi
